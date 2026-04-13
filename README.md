@@ -4,7 +4,7 @@ Werkzeug zur Auswertung der BaFin-Vergleichsversion des MaRisk-Rundschreibens. A
 
 ## Zweck
 
-Die BaFin veröffentlicht Konsultationen und Novellen der MaRisk als Vergleichs-PDF (gestrichen rot, neu rot unterstrichen, verschoben grün, Tz-Umnummerierungen lila). Das ist zum Lesen geeignet, aber nicht filterbar, sortierbar oder kommentierbar. Dieses Tool wandelt die 148 PDF-Seiten in eine **Excel-Arbeitsgrundlage** um, in der jede Textziffer eine Zeile ist, mit vollständiger Rich-Text-Darstellung der Änderungen.
+Die BaFin veröffentlicht Konsultationen und Novellen der MaRisk als Vergleichs-PDF (gestrichen rot, neu rot unterstrichen, verschoben grün, Tz-Umnummerierungen lila). Das ist zum Lesen geeignet, aber nicht filterbar, sortierbar oder kommentierbar. Dieses Tool wandelt das PDF in eine **Excel-Arbeitsgrundlage** um, in der jede Textziffer eine Zeile ist, mit vollständiger Rich-Text-Darstellung der Änderungen.
 
 Typische Anwendung: Impact-Assessment für die Umsetzung der Novelle in einer Bank oder Beratung.
 
@@ -22,13 +22,7 @@ pip3 install --break-system-packages pymupdf openpyxl
 
 ## Eingabedatei
 
-Die Vergleichs-PDF der BaFin muss im Projektverzeichnis liegen:
-
-```
-dl_kon_02_2026_rs_marisk-novelle_vergleichsversion.pdf
-```
-
-Der Dateiname ist in [analyze.py](analyze.py) unter der Konstante `PDF` festgelegt.
+Die MaRisk-Vergleichs-PDF der BaFin muss im Projektverzeichnis liegen. Der erwartete Dateiname ist in [analyze.py](analyze.py) unter der Konstante `PDF` hinterlegt und kann bei einer neuen Novelle dort angepasst werden.
 
 ## Verwendung
 
@@ -85,8 +79,8 @@ Der Zeilenhintergrund richtet sich nach dem „stärkeren" Änderungsstatus der 
 |---|---|
 | [analyze.py](analyze.py) | Haupt-Skript, erzeugt die Excel |
 | [marisk_parser.py](marisk_parser.py) | PDF-Parser-Bibliothek (Zeichen, Farben, Absätze, Rich-Text) |
-| [dl_kon_02_2026_rs_marisk-novelle_vergleichsversion.pdf](dl_kon_02_2026_rs_marisk-novelle_vergleichsversion.pdf) | Eingabe-PDF der BaFin |
-| [MaRisk_Aenderungsanalyse_pro_Textziffer.xlsx](MaRisk_Aenderungsanalyse_pro_Textziffer.xlsx) | generierte Excel-Ausgabe |
+| `dl_kon_*_rs_marisk-*_vergleichsversion.pdf` | Eingabe-PDF der BaFin (nicht im Repo, lokal abzulegen) |
+| `MaRisk_Aenderungsanalyse_pro_Textziffer.xlsx` | generierte Excel-Ausgabe (nicht im Repo, wird vom Skript erzeugt) |
 
 ## Technik in Kurzform
 
