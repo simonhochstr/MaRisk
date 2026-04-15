@@ -44,9 +44,9 @@ Das Skript parst alle Seiten und erzeugt `MaRisk_Aenderungsanalyse_pro_Textziffe
 | D Erläuterung | Rich-Text aller zur Tz gehörenden rechten Spalten-Absätze |
 | E Änderungsart Normtext | unverändert / geändert / gestrichen / hinzugefügt / verschoben |
 | F Änderungsart Erläuterung | dasselbe Schema für die Erläuterung |
-| G Verschiebung | heuristischer Ziel- oder Herkunfts-Code |
+| G Verschiebung | heuristischer Ziel- oder Herkunfts-Code (Volltext- oder Teiltext-Match) |
 | H Unsicher | `Ja`, wenn Verschiebungs-Match unter 75 % Ähnlichkeit |
-| I Anmerkungen | automatische Diff-Summary (Wortzahlen, Umformulierungs-Hinweis) + Verschiebungs-Vermerke |
+| I Anmerkungen | automatische Diff-Summary (Wortzahlen, Umformulierungs-Hinweis) + Verschiebungs-Vermerke inkl. Ähnlichkeit in %; `Teilverschiebung` = nur Teile des Textkörpers erscheinen an anderer Stelle |
 
 **Arbeitsblatt „Legende"** — Erklärung aller Spalten und Farbcodes.
 
@@ -93,9 +93,24 @@ Der Zeilenhintergrund richtet sich nach dem „stärkeren" Änderungsstatus der 
 - Fußnoten-Marker in der Marge werden erkannt und aus der Auswertung entfernt.
 - Pure-deleted alte Tz-Nummern werden als `alt Tz. N` in eigener Zeile dargestellt, damit sie nicht mit umnummerierten neuen Tz gleicher Nummer kollidieren.
 
+### 5-Pass-Verschiebungsanalyse (Spalten G / I)
+
+Für jede gestrichene Tz werden alle hinzugefügten Tz in fünf Stufen abgeglichen. Normtext **und** Erläuterung fließen in den Vergleich ein:
+
+| Pass | Vergleichsbasis | Schwellenwert |
+|---|---|---|
+| 1 – Volltext | Gesamter Textkörper beider Seiten (bis 900 Z.) — Vorfilter für Passes 2–5 | ≥ 20 % |
+| 2 – Absätze | Jeder Absatz der Quell-Tz als Gleitfenster im Zieltext | ≥ 68 % |
+| 3 – Positionsfenster | Anfangs-, Mittel- und Endblock (~45 % der Länge) als Fenster im Zieltext | ≥ 68 % |
+| 4 – Rückwärts | Absätze und Fenster der Ziel-Tz gegen den Quelltext | ≥ 68 % |
+| 5 – Satz-Fingerabdruck | Anteil gemeinsamer Sätze (Einzelsatz-Ähnlichkeit ≥ 82 %) | ≥ 55 % |
+
+Passes 2–5 laufen nur für die Top-20-Kandidaten aus Pass 1 sowie alle mit Pass-1-Score ≥ 20 %. Die Ähnlichkeit wird als Prozentwert in Spalte I ausgewiesen; Teilverschiebungen (nur ein Abschnitt des Textkörpers erscheint woanders) werden explizit als `Teilverschiebung` gekennzeichnet.
+
 ## Bekannte Einschränkungen
 
 - Verschmolzene Alt-/Neu-Spans im Fließtext (z. B. `gibtzeigt` = alt `gibt` + neu `zeigt`) werden im Rich-Text korrekt per Strike/Underline unterschieden, sehen im reinen Text aber zusammengeklebt aus.
 - Die Verschiebungs-Heuristik (Spalten G/H) ist ein Vorschlag; Treffer mit Spalte H = `Ja` sollten manuell geprüft werden.
 - Vollständig gestrichene und neu eingefügte Tz, die strukturell einer Umnummerierung entsprechen (Blocktausch), erscheinen als getrennte Gestrichen-/Hinzugefügt-Zeilen ohne Eintrag in Spalte B — diese Fälle fängt die Verschiebungs-Heuristik auf.
+- Teilverschiebungen (ein Absatz oder Block einer Tz taucht in einer anderen Tz auf) werden über Passes 2–4 erkannt und in Spalte I als `Teilverschiebung` gekennzeichnet. Der Schwellenwert liegt bei 68 % Ähnlichkeit (vs. 55 % beim Volltext-Match).
 - Die Einlese-Logik ist auf den konkreten Aufbau der BaFin-Vergleichs-PDFs (Spaltenlayout, Schriftarten, Farbpalette) zugeschnitten. Bei anderen PDFs können Schwellenwerte angepasst werden müssen.

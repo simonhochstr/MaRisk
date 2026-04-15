@@ -11,6 +11,7 @@ Spaltenschema:
   D Erläuterung            E Änderungsart Norm F Änderungsart Erl.
   G Verschiebung           H Unsicher          I Anmerkungen
 """
+import re
 import fitz
 from difflib import SequenceMatcher
 from openpyxl import Workbook
@@ -179,44 +180,207 @@ def build_tz_rows(paragraphs):
     return rows, renames
 
 
+_SENT_SPLIT = re.compile(r'(?<=[.;!?])\s+|\n+')
+
+
+def _ratio(a: str, b: str, cap: int = 900) -> float:
+    """Direkter SequenceMatcher-Vergleich, geclipt auf `cap` Zeichen."""
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a[:cap], b[:cap]).ratio()
+
+
+def _partial_ratio(needle: str, haystack: str, cap: int = 600) -> float:
+    """Gleitet `needle` als Fenster über `haystack`; gibt besten ratio zurück.
+
+    Fensterbreite = len(needle) + 25 % Toleranz.
+    Ist needle >= haystack, direkter Vergleich.
+    """
+    if not needle or not haystack:
+        return 0.0
+    n_clip = needle[:cap]
+    if len(needle) >= len(haystack):
+        return SequenceMatcher(None, n_clip, haystack[:cap]).ratio()
+    window = min(len(needle) + max(len(needle) // 4, 40), len(haystack))
+    step = max(1, window // 8)
+    best = 0.0
+    for start in range(0, len(haystack) - window + 1, step):
+        r = SequenceMatcher(None, n_clip,
+                            haystack[start:start + window][:cap]).ratio()
+        if r > best:
+            best = r
+    return best
+
+
+def _sentences(text: str, min_len: int = 55) -> list:
+    """Zerlegt Text in Sätze; begrenzt auf 12 Stück."""
+    parts = _SENT_SPLIT.split(text)
+    return [p.strip() for p in parts if len(p.strip()) >= min_len][:12]
+
+
+def _position_windows(text: str, min_len: int = 40) -> list:
+    """Drei überlappende Fenster (Anfang / Mitte / Ende) mit ~45 % Textlänge.
+
+    Dient dazu, Textteile zu finden, die weder als Absatz noch als ganzer
+    Block in einem anderen Tz auftauchen, aber als mittlerer Abschnitt.
+    """
+    size = max(min_len, int(len(text) * 0.45))
+    if size >= len(text):
+        return [text]
+    centres = [size // 2, len(text) // 2, len(text) - size // 2]
+    seen, result = set(), []
+    for c in centres:
+        start = max(0, c - size // 2)
+        w = text[start:start + size].strip()
+        if len(w) >= min_len and w not in seen:
+            result.append(w)
+            seen.add(w)
+    return result
+
+
 def find_tz_moves(rows):
-    """Simple heuristic: match gestrichene Tz-Normtexte zu neu hinzugefügten."""
+    """5-Pass-Heuristik: gestrichene Tz gegen hinzugefügte matchen.
+
+    Pass 1 – Volltext          : gesamter Textkörper beider Seiten (bis 900 Z.)
+    Pass 2 – Absätze vorwärts  : jeder Absatz von dt als Fenster in at
+    Pass 3 – Positions­fenster  : Anfang/Mitte/Ende-Block von dt in at
+    Pass 4 – Rückwärts         : Absätze und Fenster von at in dt
+    Pass 5 – Satz-Fingerabdruck: Anteil gemeinsamer Sätze (≥ 82 % Ähnlichkeit)
+
+    Passes 2–5 werden nur für Kandidaten durchgeführt, die in Pass 1
+    mindestens 0,20 Ähnlichkeit erreichen (Vorfilter), um die Laufzeit
+    zu begrenzen. Pro gelöschter Tz werden max. 20 Kandidaten tiefgehend
+    analysiert; zusätzlich alle mit Pass-1-Score ≥ 0,35.
+
+    Berücksichtigt Normtext und Erläuterung (expl_segs).
+    """
+    MIN_LEN = 40
+    PREFILTER  = 0.20   # Pass-1-Mindest-Score für tiefe Analyse
+    TOP_K      = 20     # Anzahl bester Kandidaten für Passes 2–5
+    FULL_THR   = 0.55   # Mindest-Score für Volltext-Match (Ausgabe)
+    PART_THR   = 0.68   # Mindest-Score für Teiltext-Match (Ausgabe)
+
     def del_text(r):
-        return plain_text(r["norm_segs"],
-                          fmt_filter={"deleted", "moved_from"}).strip()
+        t = plain_text(r["norm_segs"],
+                       fmt_filter={"deleted", "moved_from"}).strip()
+        e = plain_text(r["expl_segs"],
+                       fmt_filter={"deleted", "moved_from"}).strip()
+        return (t + ("\n" + e if e else "")).strip()
+
     def add_text(r):
-        return plain_text(r["norm_segs"],
-                          fmt_filter={"added", "moved_to"}).strip()
+        t = plain_text(r["norm_segs"],
+                       fmt_filter={"added", "moved_to"}).strip()
+        e = plain_text(r["expl_segs"],
+                       fmt_filter={"added", "moved_to"}).strip()
+        return (t + ("\n" + e if e else "")).strip()
 
-    dels = [(i, del_text(r)) for i, r in enumerate(rows) if r["kind"] == "tz"]
-    dels = [(i, t) for i, t in dels if len(t) >= 40]
-    adds = [(i, add_text(r)) for i, r in enumerate(rows) if r["kind"] == "tz"]
-    adds = [(i, t) for i, t in adds if len(t) >= 40]
+    tz_idxs = [i for i, r in enumerate(rows) if r["kind"] == "tz"]
+    del_map = {i: del_text(rows[i]) for i in tz_idxs}
+    add_map = {i: add_text(rows[i]) for i in tz_idxs}
 
-    for i, dt in dels:
-        best = 0.0
-        bj = None
-        for j, at in adds:
+    del_idxs = [i for i in tz_idxs if len(del_map[i]) >= MIN_LEN]
+    add_idxs = [i for i in tz_idxs if len(add_map[i]) >= MIN_LEN]
+
+    # Vorbereitung: Absätze, Positionsfenster, Sätze
+    del_paras = {i: [p.strip() for p in del_map[i].split("\n")
+                     if len(p.strip()) >= MIN_LEN] for i in del_idxs}
+    add_paras = {i: [p.strip() for p in add_map[i].split("\n")
+                     if len(p.strip()) >= MIN_LEN] for i in add_idxs}
+    del_wins  = {i: _position_windows(del_map[i]) for i in del_idxs}
+    add_wins  = {i: _position_windows(add_map[i]) for i in add_idxs}
+    del_sents = {i: _sentences(del_map[i]) for i in del_idxs}
+    add_sents = {i: _sentences(add_map[i]) for i in add_idxs}
+
+    n = len(del_idxs)
+    best_score   = {}
+    best_partner = {}
+    best_partial = {}
+
+    def register(i, j, score, partial):
+        if score > best_score.get(i, 0.0):
+            best_score[i]   = score
+            best_partner[i] = j
+            best_partial[i] = partial
+
+    for idx, i in enumerate(del_idxs, 1):
+        if idx % 25 == 0 or idx == 1:
+            print(f"  Verschiebungsanalyse {idx}/{n} …")
+        dt = del_map[i]
+
+        # Pass 1: Volltext-Vorfilter für alle add-Texte
+        p1_scores = []
+        for j in add_idxs:
             if j == i:
                 continue
-            if abs(len(at) - len(dt)) > max(len(dt), len(at)) * 0.8:
-                continue
-            ratio = SequenceMatcher(None, dt[:500], at[:500]).ratio()
-            if ratio > best:
-                best = ratio
-                bj = j
-        if bj is not None and best >= 0.55:
-            rows[i].setdefault("G", rows[bj]["label"])
-            rows[i]["notes"].append(
-                f"mögliche Verschiebung nach {rows[bj]['label']} (Ähnlichkeit {best:.2f})"
-            )
-            rows[bj].setdefault("G", rows[i]["label"])
-            rows[bj]["notes"].append(
-                f"mögliche Herkunft aus {rows[i]['label']} (Ähnlichkeit {best:.2f})"
-            )
-            if best < 0.75:
-                rows[i]["uncertain"] = True
-                rows[bj]["uncertain"] = True
+            at = add_map[j]
+            lr = len(dt) / len(at) if at else 0
+            if 0.10 <= lr <= 10.0:
+                r = _ratio(dt, at, 900)
+                p1_scores.append((r, j))
+                register(i, j, r, False)
+
+        # Kandidaten für Passes 2–5: Top-K + alle mit Score ≥ PREFILTER
+        p1_scores.sort(reverse=True)
+        deep_js = {j for _, j in p1_scores[:TOP_K]}
+        deep_js |= {j for r, j in p1_scores if r >= PREFILTER}
+
+        for j in deep_js:
+            at = add_map[j]
+
+            # Pass 2: Absätze von dt als Fenster in at
+            for para in del_paras[i]:
+                r = _partial_ratio(para, at)
+                if r >= PART_THR:
+                    register(i, j, r, True)
+
+            # Pass 3: Positions­fenster (Anfang/Mitte/Ende) von dt in at
+            for win in del_wins[i]:
+                r = _partial_ratio(win, at)
+                if r >= PART_THR:
+                    register(i, j, r, True)
+
+            # Pass 4: Rückwärts — Absätze und Fenster von at in dt
+            for para in add_paras[j]:
+                r = _partial_ratio(para, dt)
+                if r >= PART_THR:
+                    register(i, j, r, True)
+            for win in add_wins[j]:
+                r = _partial_ratio(win, dt)
+                if r >= PART_THR:
+                    register(i, j, r, True)
+
+            # Pass 5: Satz-Fingerabdruck
+            ds_list = del_sents[i]
+            as_list = add_sents[j]
+            if ds_list and as_list:
+                hits = sum(
+                    1 for d in ds_list
+                    if any(_ratio(d, a, 300) >= 0.82 for a in as_list)
+                )
+                if hits:
+                    register(i, j, hits / len(ds_list), hits < len(ds_list))
+
+    # Ergebnisse eintragen
+    for i in del_idxs:
+        score = best_score.get(i, 0.0)
+        j     = best_partner.get(i)
+        if j is None or score < FULL_THR:
+            continue
+        partial    = best_partial.get(i, False)
+        kind_label = "Teilverschiebung" if partial else "Verschiebung"
+        rows[i].setdefault("G", rows[j]["label"])
+        rows[i]["notes"].append(
+            f"mögliche {kind_label} nach {rows[j]['label']} "
+            f"(Ähnlichkeit {score:.0%})"
+        )
+        rows[j].setdefault("G", rows[i]["label"])
+        rows[j]["notes"].append(
+            f"mögliche Herkunft aus {rows[i]['label']} "
+            f"(Ähnlichkeit {score:.0%})"
+        )
+        if score < 0.75:
+            rows[i]["uncertain"] = True
+            rows[j]["uncertain"] = True
 
 
 def write_excel(rows, renames=None):
@@ -308,9 +472,9 @@ def write_excel(rows, renames=None):
         ("D – Erläuterung",           "Rich-Text aller rechten Spalten-Absätze, die zu der Tz gehören"),
         ("E – Änderungsart Normtext",      "unverändert / geändert / gestrichen / hinzugefügt / verschoben"),
         ("F – Änderungsart Erläuterung",   "dasselbe Schema für die Erläuterung"),
-        ("G – Verschiebung",          "Heuristische Ziel-/Herkunfts-Tz für inhaltliche Verschiebungen"),
+        ("G – Verschiebung",          "Heuristische Ziel-/Herkunfts-Tz für inhaltliche Verschiebungen (Volltext oder Teiltext)"),
         ("H – Unsicher",              "'Ja' = Verschiebungs-Match unter 75 % Ähnlichkeit"),
-        ("I – Anmerkungen",           "Diff-Summary (Wortzahlen, Umformulierungs-Hinweis) und Verschiebungs-Vermerke"),
+        ("I – Anmerkungen",           "Diff-Summary (Wortzahlen, Umformulierungs-Hinweis) und Verschiebungs-Vermerke mit Ähnlichkeit in %. 'Teilverschiebung' = nur Teile des Textkörpers erscheinen an anderer Stelle."),
         ("", ""),
         ("schwarzer Text in C/D",                   "unverändert"),
         ("rot + Durchstreichung",                    "gestrichen (alt)"),
