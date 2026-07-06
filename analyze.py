@@ -6,10 +6,10 @@ Hauptskript für die Auswertung. Die PDF-Parser-Helfer
 marisk_parser.py. Dieses Skript baut darauf die Tz-Zeilen, fasst pro
 Textziffer zusammen und schreibt die Excel-Datei.
 
-Spaltenschema:
-  A Textziffer (neu)       B alte Referenz     C Normtext
-  D Erläuterung            E Änderungsart Norm F Änderungsart Erl.
-  G Verschiebung           H Unsicher          I Anmerkungen
+Spaltenschema (je Tz zwei Zeilen: erst Normtext, dann Erläuterung darunter):
+  A Textziffer (neu)       B alte Referenz     C Inhaltstyp
+  D Inhalt                 E Änderungsart      F Verschiebung
+  G Unsicher               H Anmerkungen
 """
 import re
 import fitz
@@ -21,10 +21,84 @@ from marisk_parser import (
     load_page, group_paragraphs, plain_text, segs_to_rich,
     classify_entry, SECTION_RE, _postprocess_xlsx,
     split_footnote_from_tz, diff_summary,
+    use_profile, is_toc_page,
 )
 
-PDF = "dl_kon_02_2026_rs_marisk-novelle_vergleichsversion.pdf"
+# Bekannte BaFin-Vergleichs-PDFs und ihr Layout-Profil (siehe marisk_parser.
+# PROFILES). Neue Dokumente hier eintragen; unbekannte fallen auf
+# "vergleichsfassung" zurück (aktuelles Querformat-Layout).
+DOCUMENTS = {
+    "dl_kon_02_2026_rs_marisk-novelle_vergleichsversion.pdf": "konsultation",
+    "dl_rs_0626_9_marisk_vergleichsfassung_8_marisk.pdf":     "vergleichsfassung",
+}
+
+PDF = "dl_rs_0626_9_marisk_vergleichsfassung_8_marisk.pdf"
+LAYOUT = DOCUMENTS.get(PDF, "vergleichsfassung")
 OUT = "MaRisk_Aenderungsanalyse_pro_Textziffer.xlsx"
+
+# Referenz-Einzelfassungen (unmarkiert) je Vergleichsdokument. Der Textkörper
+# jeder Tz wird gegen diese sauberen Dokumente gematcht, um Spalte A (neue
+# Referenz) und Spalte B (alte Referenz) zuverlässig zu bestimmen – unabhängig
+# von der teils unzuverlässigen Abschnitts-/Seitenstruktur der Vergleichsfassung.
+# 'new' → Quelle Spalte A (leer bei vollständig gestrichener Tz)
+# 'old' → Quelle Spalte B (leer bei neu hinzugefügter Tz)
+REFERENCES = {
+    "dl_rs_0626_9_marisk_vergleichsfassung_8_marisk.pdf": {
+        "new": "dl_rs_0626_9_marisk.pdf",
+        "old": "dl_Anlage_1_2024-05-29-erlaeuterungen_RS_06_2024_pdf_BA.pdf",
+        "profile": "vergleichsfassung",
+    },
+}
+
+MATCH_THR = 0.50    # Mindest-Ähnlichkeit für einen sicheren Referenz-Treffer
+
+
+# --- Bindestrich-Bereinigung (Trennung am Zeilenende) ------------------------
+_CONJ_AFTER = {"und", "oder", "bzw", "sowie", "als", "aber", "beziehungsweise",
+               "wie", "auch"}
+
+
+def dehyphenate_segs(segs):
+    """Entfernt Trennungs-Bindestriche am Segmentende, die nur vom Zeilen-
+    umbruch stammen (z. B. 'Kreditwesenge-' + 'setzes' → 'Kreditwesenge…setzes').
+
+    Konservativ: Ein '-' am Segmentende wird nur entfernt, wenn davor ein
+    Kleinbuchstabe steht UND das nächste Segment mit einem Kleinbuchstaben
+    beginnt UND dieses nächste Wort keine Konjunktion ist (dann handelt es
+    sich um eine echte Zusammensetzung wie 'Aufbau- und Ablauf…'). Im Zweifel
+    bleibt der Bindestrich stehen.
+    """
+    out = [dict(s) for s in segs]
+    for i in range(len(out) - 1):
+        t = out[i]["text"]
+        if len(t) < 2 or t[-1] != "-" or not (t[-2].isalpha() and t[-2].islower()):
+            continue
+        j = i + 1
+        while j < len(out) and out[j]["text"].strip() == "":
+            j += 1
+        if j >= len(out):
+            continue
+        nt = out[j]["text"].lstrip()
+        if not nt or not nt[0].isalpha() or not nt[0].islower():
+            continue
+        first_word = re.match(r"[a-zäöüß]+", nt)
+        if first_word and first_word.group(0) in _CONJ_AFTER:
+            continue
+        out[i]["text"] = t[:-1]
+    return out
+
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm_ws(t):
+    return _WS_RE.sub(" ", t).strip()
+
+
+def _match_text(segs):
+    """Vergleichstext eines Segment-Blocks: bindestrich-bereinigt, Whitespace
+    normalisiert."""
+    return _norm_ws(plain_text(dehyphenate_segs(segs)))
 
 
 def build_tz_rows(paragraphs):
@@ -383,13 +457,208 @@ def find_tz_moves(rows):
             rows[j]["uncertain"] = True
 
 
+def _best_match(text, index, cap=280, floor=0.0):
+    """Bester Treffer von `text` gegen index=[(label, ref_text)] via
+    SequenceMatcher. Gibt (label, score) zurück."""
+    text = text[:cap]
+    if len(text) < 12:
+        return None, 0.0
+    best_lbl, best = None, floor
+    for lbl, ref in index:
+        sm = SequenceMatcher(None, text, ref[:cap])
+        if sm.real_quick_ratio() <= best:
+            continue
+        r = sm.ratio()
+        if r > best:
+            best, best_lbl = r, lbl
+    return best_lbl, best
+
+
+def _row_side_text(r, fmts):
+    """Bindestrich-bereinigter, normalisierter Text einer Tz-Zeile für eine
+    Seite (neu = unchanged/added/moved_to, alt = unchanged/deleted/moved_from).
+    """
+    segs = [s for s in (r["norm_segs"] + r["expl_segs"]) if s["fmt"] in fmts]
+    return _match_text(segs)
+
+
+def parse_reference(pdf_path, profile_name):
+    """Parst eine unmarkierte MaRisk-Einzelfassung zu einer Tz-Liste.
+
+    Rückgabe: Liste von Dicts {label, norm, expl, match} – `match` ist der
+    bindestrich-bereinigte Vergleichstext.
+    """
+    use_profile(profile_name)
+    doc = fitz.open(pdf_path)
+    toc = {p for p in range(len(doc)) if is_toc_page(doc[p])}
+    all_segs = []
+    for pno in range(len(doc)):
+        if pno in toc:
+            continue
+        segs = load_page(doc[pno])
+        for s in segs:
+            s["page"] = pno
+        all_segs.extend(segs)
+    paragraphs = group_paragraphs(all_segs)
+    first = next((k for k, p in enumerate(paragraphs)
+                  if p["kind"] == "section"
+                  and SECTION_RE.match(plain_text(p["segs"]).strip() or "")), 0)
+    paragraphs = paragraphs[first:]
+    by_page = {}
+    for p in paragraphs:
+        by_page.setdefault(p["page"], []).append(p)
+    ordered = []
+    for pno in sorted(by_page):
+        ordered.extend(sorted(by_page[pno],
+                              key=lambda p: (round(p["y_top"], 0),
+                                             0 if p["col"] == "L" else 1)))
+    rows, _ = build_tz_rows(ordered)
+    index = []
+    for r in rows:
+        if r["kind"] != "tz":
+            continue
+        match = _match_text(r["norm_segs"] + r["expl_segs"])
+        if match:
+            index.append({
+                "label": r["label"],
+                "norm": _norm_ws(plain_text(dehyphenate_segs(r["norm_segs"]))),
+                "expl": _norm_ws(plain_text(dehyphenate_segs(r["expl_segs"]))),
+                "match": match,
+            })
+    return index
+
+
+def _ref_sort_key(label):
+    """Sortierschlüssel (Sektion, Tz-Nummer) aus einem Label wie
+    'AT 4.3.4 Tz. 5' – für das Einsortieren ergänzter Tz."""
+    m = re.match(r"(.+?)\s+(?:alt\s+)?Tz\.\s*(\d+)", label)
+    if m:
+        sec = m.group(1)
+        num = int(m.group(2))
+    else:
+        sec, num = label, 0
+    parts = re.match(r"([A-Z]+)\s*([\d.]*)", sec)
+    mod = parts.group(1) if parts else sec
+    nums = tuple(int(x) for x in re.findall(r"\d+", parts.group(2))) if parts else ()
+    return (mod, nums, num)
+
+
+def assign_and_recover(rows, cfg):
+    """Füllt A_ref (neu) und B_ref (alt) je Tz-Zeile per Textabgleich gegen die
+    Einzelfassungen und ergänzt in der Neufassung vorhandene, aber im Excel
+    nicht sauber zugeordnete Tz.
+
+    Gibt (n_recovered, n_new_ref, n_old_ref) zurück.
+    """
+    print(f"Referenz-Abgleich: parse {cfg['new']} …")
+    new_index = parse_reference(cfg["new"], cfg["profile"])
+    print(f"Referenz-Abgleich: parse {cfg['old']} …")
+    old_index = parse_reference(cfg["old"], cfg["profile"])
+    use_profile(LAYOUT)   # aktives Profil für Hauptdokument wiederherstellen
+
+    # Getrennte Referenz-Indizes für Normtext und Erläuterung, damit
+    # Textziffer- und Erläuterungs-Zeile jeweils eigenständig gematcht werden.
+    new_norm = [(e["label"], e["norm"]) for e in new_index if e["norm"]]
+    new_expl = [(e["label"], e["expl"]) for e in new_index if e["expl"]]
+    old_norm = [(e["label"], e["norm"]) for e in old_index if e["norm"]]
+    old_expl = [(e["label"], e["expl"]) for e in old_index if e["expl"]]
+    old_all = [(e["label"], e["match"]) for e in old_index]
+    # Getrennt verfolgen, welcher Teil (Norm/Erläuterung) je neuem Tz-Label
+    # bereits über eine Vergleichsfassungs-Zeile abgedeckt ist.
+    matched_norm, matched_expl, matched_old = set(), set(), set()
+
+    def assign(part_segs, new_idx, old_idx, label):
+        """Bestimmt (A, B) für einen Segment-Block (Normtext oder Erläuterung).
+        A = neue Referenz (leer wenn vollständig gestrichen), B = alte Referenz
+        (leer wenn neu hinzugefügt). Gibt (A, B, matched_new, matched_old)."""
+        new_txt = _match_text([s for s in part_segs
+                               if s["fmt"] in ("unchanged", "added", "moved_to")])
+        old_txt = _match_text([s for s in part_segs
+                               if s["fmt"] in ("unchanged", "deleted", "moved_from")])
+        a, mn = "", None
+        if len(new_txt) >= 12:
+            lbl, sc = _best_match(new_txt, new_idx)
+            if lbl and sc >= MATCH_THR:
+                a, mn = lbl, lbl
+            else:
+                a = label            # Fallback: geparste Bezeichnung
+        b, mo = "", None
+        if len(old_txt) >= 12:
+            lbl, sc = _best_match(old_txt, old_idx)
+            if lbl and sc >= MATCH_THR:
+                b, mo = lbl, lbl
+        return a, b, mn, mo
+
+    print(f"Referenz-Abgleich: {len([r for r in rows if r['kind']=='tz'])} Tz "
+          f"gegen {len(new_index)} neue / {len(old_index)} alte …")
+    for r in rows:
+        if r["kind"] != "tz":
+            continue
+        # Textziffer-Zeile (Normtext) und Erläuterungs-Zeile getrennt matchen.
+        r["A_norm"], r["B_norm"], mnA, moB = assign(
+            r["norm_segs"], new_norm, old_norm, r["label"])
+        r["A_expl"], r["B_expl"], meA, moE = assign(
+            r["expl_segs"], new_expl, old_expl, r["label"])
+        if mnA:
+            matched_norm.add(mnA)
+        if meA:
+            matched_expl.add(meA)
+        for m in (moB, moE):
+            if m:
+                matched_old.add(m)
+
+    # Fehlende Teile ergänzen: in der Neufassung vorhanden, in der
+    # Vergleichsfassung aber nicht sauber zugeordnet. Norm und Erläuterung
+    # werden getrennt geprüft, damit ein fehlender Normtext nicht deshalb
+    # verloren geht, weil die Erläuterung derselben Tz anderswo gematcht wurde.
+    recovered = []
+    for e in new_index:
+        if not re.search(r"Tz\.\s*\d", e["label"]):
+            continue
+        need_norm = bool(e["norm"]) and len(e["norm"]) >= 20 \
+            and e["label"] not in matched_norm
+        need_expl = bool(e["expl"]) and len(e["expl"]) >= 20 \
+            and e["label"] not in matched_expl
+        if not (need_norm or need_expl):
+            continue
+        olbl, osc = _best_match(e["match"], old_all)
+        b_ref = olbl if (olbl and osc >= MATCH_THR) else ""
+        fmt = "unchanged" if b_ref else "added"
+        mk = lambda txt: [{"text": txt, "fmt": fmt, "flags": 0,
+                           "size": 10, "font": "Calibri"}]
+        recovered.append({
+            "kind": "tz", "label": e["label"], "old_ref": b_ref,
+            "A_norm": e["label"], "B_norm": b_ref,
+            "A_expl": e["label"], "B_expl": b_ref,
+            "norm_segs": mk(e["norm"]) if need_norm else [],
+            "expl_segs": mk(e["expl"]) if need_expl else [],
+            "notes": ["aus Neufassung ergänzt (in Vergleichsfassung nicht "
+                      "sauber zugeordnet)"],
+        })
+
+    # Ergänzte Tz an der passenden Stelle einsortieren (nach Referenz-Sortierung).
+    if recovered:
+        merged = list(rows)
+        for rec in recovered:
+            key = _ref_sort_key(rec["A_norm"])
+            pos = len(merged)
+            for i, r in enumerate(merged):
+                lbl = r.get("A_norm") or r.get("label", "")
+                if r["kind"] == "tz" and lbl and _ref_sort_key(lbl) > key:
+                    pos = i
+                    break
+            merged.insert(pos, rec)
+        rows[:] = merged
+
+    return len(recovered), len(matched_norm | matched_expl), len(matched_old)
+
+
 def write_excel(rows, renames=None):
     wb = Workbook()
     ws = wb.active
     ws.title = "Änderungen pro Tz"
-    headers = ["Textziffer", "alte Referenz", "Normtext", "Erläuterung",
-               "Änderungsart Normtext", "Änderungsart Erläuterung",
-               "Verschiebung", "Unsicher", "Anmerkungen"]
+    headers = ["Textziffer", "alte Referenz", "Inhaltstyp", "Inhalt",
+               "Änderungsart", "Verschiebung", "Unsicher", "Anmerkungen"]
     ws.append(headers)
     header_font = Font(bold=True)
     for c in ws[1]:
@@ -405,57 +674,71 @@ def write_excel(rows, renames=None):
         "verschoben nachher":PatternFill("solid", fgColor="FFEDFADE"),
     }
     heading_fill = PatternFill("solid", fgColor="FFEDE7F6")
-    # For the overall row colour use the "strongest" change of the two
-    # columns — geändert > gestrichen/hinzugefügt > verschoben > unverändert.
-    severity = {
-        "unverändert": 0, "verschoben nachher": 1, "verschoben vorher": 1,
-        "hinzugefügt": 2, "gestrichen": 2, "geändert": 3,
-    }
+    N_COLS = len(headers)
 
-    for r in rows:
-        norm_rich = segs_to_rich(r["norm_segs"])
-        expl_rich = segs_to_rich(r["expl_segs"])
-        d_norm = classify_entry(r["norm_segs"]) if r["norm_segs"] else "unverändert"
-        d_expl = classify_entry(r["expl_segs"]) if r["expl_segs"] else "unverändert"
-        g = r.get("G", "")
-        uncertain = "Ja" if r.get("uncertain") else "Nein"
-        auto_notes = list(r.get("notes", []))
-        norm_sum = diff_summary(r["norm_segs"])
-        if norm_sum:
-            auto_notes.append(f"Normtext: {norm_sum}")
-        expl_sum = diff_summary(r["expl_segs"])
-        if expl_sum:
-            auto_notes.append(f"Erläuterung: {expl_sum}")
-        notes = "; ".join(auto_notes)
-
-        old_ref = r.get("old_ref", "")
-        if r["kind"] == "section_header":
-            heading_note = notes or "Überschrift"
-            ws.append([r["label"], old_ref, norm_rich, "",
-                       d_norm, "", "", "", heading_note])
-            row_idx = ws.max_row
-            fill = heading_fill if d_norm != "unverändert" else fills["unverändert"]
-        else:
-            ws.append([r["label"], old_ref, norm_rich, expl_rich,
-                       d_norm, d_expl, g, uncertain, notes])
-            row_idx = ws.max_row
-            worst = max(severity.get(d_norm, 0), severity.get(d_expl, 0))
-            if worst == 0:
-                d_row = "unverändert"
-            elif worst == 3:
-                d_row = "geändert"
-            else:
-                # pick the first non-unverändert
-                d_row = d_norm if severity.get(d_norm, 0) >= severity.get(d_expl, 0) else d_expl
-            fill = fills.get(d_row, fills["unverändert"])
-
-        for col_i in range(1, 10):
+    def emit(a_val, b_val, inhaltstyp, rich, art, verschiebung,
+             uncertain, notes, fill):
+        # Regel: wenn A = B, dann B leer lassen (Referenz unverändert).
+        if b_val and b_val == a_val:
+            b_val = ""
+        ws.append([a_val, b_val, inhaltstyp, rich, art,
+                   verschiebung, uncertain, notes])
+        row_idx = ws.max_row
+        for col_i in range(1, N_COLS + 1):
             cell = ws.cell(row=row_idx, column=col_i)
             cell.fill = fill
             cell.alignment = Alignment(wrap_text=True, vertical="top")
 
-    widths = {"A": 20, "B": 20, "C": 70, "D": 70, "E": 18, "F": 18,
-              "G": 18, "H": 10, "I": 38}
+    for r in rows:
+        norm_segs = dehyphenate_segs(r["norm_segs"])
+        expl_segs = dehyphenate_segs(r["expl_segs"])
+
+        if r["kind"] == "section_header":
+            a_val = r.get("label", "")
+            b_val = r.get("old_ref", "")
+            norm_rich = segs_to_rich(norm_segs)
+            d_norm = classify_entry(norm_segs) if norm_segs else "unverändert"
+            heading_note = "; ".join(r.get("notes", [])) or "Überschrift"
+            fill = heading_fill if d_norm != "unverändert" else fills["unverändert"]
+            emit(a_val, b_val, "Überschrift", norm_rich, d_norm,
+                 "", "", heading_note, fill)
+            continue
+
+        # --- Zeile 1: Textziffer (Normtext) – eigene A/B-Referenz ---
+        # Leere Textziffer-Zeilen (kein Normtext, nur Erläuterung) auslassen.
+        if norm_segs:
+            a_norm = r["A_norm"] if "A_norm" in r else r.get("label", "")
+            b_norm = r["B_norm"] if "B_norm" in r else r.get("old_ref", "")
+            norm_rich = segs_to_rich(norm_segs)
+            d_norm = classify_entry(norm_segs)
+            g = r.get("G", "")
+            uncertain = "Ja" if r.get("uncertain") else "Nein"
+            norm_notes = list(r.get("notes", []))
+            norm_sum = diff_summary(norm_segs)
+            if norm_sum:
+                norm_notes.append(norm_sum)
+            emit(a_norm, b_norm, "Textziffer", norm_rich, d_norm,
+                 g, uncertain, "; ".join(norm_notes),
+                 fills.get(d_norm, fills["unverändert"]))
+
+        # --- Zeile 2: Erläuterung zur Textziffer – eigene A/B-Referenz ---
+        if expl_segs:
+            a_expl = r["A_expl"] if "A_expl" in r else (r.get("label", ""))
+            b_expl = r["B_expl"] if "B_expl" in r else ""
+            expl_rich = segs_to_rich(expl_segs)
+            d_expl = classify_entry(expl_segs)
+            # Wurde keine Textziffer-Zeile ausgegeben, gehören die Tz-Notizen
+            # (z. B. 'aus Neufassung ergänzt') hierher.
+            expl_notes = [] if norm_segs else list(r.get("notes", []))
+            expl_sum = diff_summary(expl_segs)
+            if expl_sum:
+                expl_notes.append(expl_sum)
+            emit(a_expl, b_expl, "Erläuterung", expl_rich, d_expl,
+                 "", "", "; ".join(expl_notes),
+                 fills.get(d_expl, fills["unverändert"]))
+
+    widths = {"A": 20, "B": 20, "C": 12, "D": 90, "E": 18,
+              "F": 18, "G": 10, "H": 38}
     for letter, w in widths.items():
         ws.column_dimensions[letter].width = w
     ws.freeze_panes = "A2"
@@ -466,15 +749,14 @@ def write_excel(rows, renames=None):
     leg["A1"].font = header_font
     leg["B1"].font = header_font
     for a, b in [
-        ("A – Textziffer",            "neuer Abschnitt + Tz-Nummer, z.B. 'AT 1 Tz. 3'"),
-        ("B – alte Referenz",         "alter Pfad der Tz vor Umbenennung/Umnummerierung; leer wenn unverändert. Beispiel: 'AT 4.4.2 Tz. 6' für die heutige 'AT 4.4.2 Tz. 5'"),
-        ("C – Normtext",              "Rich-Text des gesamten linken Spaltentexts der Tz"),
-        ("D – Erläuterung",           "Rich-Text aller rechten Spalten-Absätze, die zu der Tz gehören"),
-        ("E – Änderungsart Normtext",      "unverändert / geändert / gestrichen / hinzugefügt / verschoben"),
-        ("F – Änderungsart Erläuterung",   "dasselbe Schema für die Erläuterung"),
-        ("G – Verschiebung",          "Heuristische Ziel-/Herkunfts-Tz für inhaltliche Verschiebungen (Volltext oder Teiltext)"),
-        ("H – Unsicher",              "'Ja' = Verschiebungs-Match unter 75 % Ähnlichkeit"),
-        ("I – Anmerkungen",           "Diff-Summary (Wortzahlen, Umformulierungs-Hinweis) und Verschiebungs-Vermerke mit Ähnlichkeit in %. 'Teilverschiebung' = nur Teile des Textkörpers erscheinen an anderer Stelle."),
+        ("A – Textziffer",            "neue Referenz (Abschnitt + Tz-Nummer), per Textabgleich gegen die neue Einzelfassung bestimmt. Leer, wenn die Tz vollständig gestrichen wurde. Bei jeder Tz stehen zwei Zeilen mit demselben Code untereinander: zuerst der Normtext, dann die Erläuterung."),
+        ("B – alte Referenz",         "alte Referenz, per Textabgleich gegen die alte Einzelfassung bestimmt. Leer, wenn die Tz neu hinzugefügt wurde. Beispiel: 'AT 4.4.2 Tz. 6' für die heutige 'AT 4.4.2 Tz. 5'"),
+        ("C – Inhaltstyp",            "'Textziffer' = Normtext der Tz (linke PDF-Spalte); 'Erläuterung' = Erläuterung zur Tz (rechte PDF-Spalte), direkt unter der Textziffer; 'Überschrift' = Abschnittsüberschrift"),
+        ("D – Inhalt",                "Rich-Text des jeweiligen Inhalts (Normtext bzw. Erläuterung) mit Farb-/Strike-/Underline-Markierungen"),
+        ("E – Änderungsart",          "unverändert / geändert / gestrichen / hinzugefügt / verschoben – bezogen auf den Inhalt der Zeile"),
+        ("F – Verschiebung",          "Heuristische Ziel-/Herkunfts-Tz für inhaltliche Verschiebungen (Volltext oder Teiltext); nur in der Textziffer-Zeile"),
+        ("G – Unsicher",              "'Ja' = Verschiebungs-Match unter 75 % Ähnlichkeit"),
+        ("H – Anmerkungen",           "Diff-Summary (Wortzahlen, Umformulierungs-Hinweis) und Verschiebungs-Vermerke mit Ähnlichkeit in %. 'Teilverschiebung' = nur Teile des Textkörpers erscheinen an anderer Stelle. 'aus Neufassung ergänzt' = Tz war in der Vergleichsfassung nicht sauber zugeordnet und wurde aus der neuen Einzelfassung ergänzt."),
         ("", ""),
         ("schwarzer Text in C/D",                   "unverändert"),
         ("rot + Durchstreichung",                    "gestrichen (alt)"),
@@ -516,9 +798,21 @@ def write_excel(rows, renames=None):
 
 def main():
     doc = fitz.open(PDF)
+    use_profile(LAYOUT)
+    print(f"Layout-Profil: {LAYOUT}")
+
+    # Inhaltsverzeichnis-Seiten (ggf. mehrere) erkennen und überspringen,
+    # damit sie nicht als Abschnitte/Textziffern eingelesen werden.
+    toc_pages = {pno for pno in range(len(doc)) if is_toc_page(doc[pno])}
+    if toc_pages:
+        print(f"Übersprungene Inhaltsverzeichnis-Seiten: "
+              f"{sorted(p + 1 for p in toc_pages)}")
+
     all_segs = []
     print(f"Parsing {len(doc)} pages…")
     for pno in range(len(doc)):
+        if pno in toc_pages:
+            continue
         page = doc[pno]
         segs = load_page(page)
         for s in segs:
@@ -555,6 +849,14 @@ def main():
           f"{len(renames)} Umbenennungen)")
 
     find_tz_moves(rows)
+
+    # Spalten A/B per Textabgleich gegen die Einzelfassungen bestimmen und
+    # fehlende Tz ergänzen (nur wenn Referenzen für dieses Dokument hinterlegt).
+    cfg = REFERENCES.get(PDF)
+    if cfg:
+        n_rec, n_a, n_b = assign_and_recover(rows, cfg)
+        print(f"Referenz-Abgleich: Spalte A {n_a} Treffer, Spalte B {n_b} Treffer, "
+              f"{n_rec} Tz aus Neufassung ergänzt")
 
     write_excel(rows, renames)
     _postprocess_xlsx(OUT)

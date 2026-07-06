@@ -66,12 +66,83 @@ def classify_char_run(base_col, has_strike, has_underline):
         return "moved_to" if has_underline else "moved_from"
     return "unchanged"
 
-# --- PDF page scan -----------------------------------------------------------
-PAGE_MID_X = 360.0         # left-column vs right-column divider
-TZ_NUM_X_MAX = 62.0        # left-margin x where Tz numbers appear
-TZ_NUM_X_MAX_R = 380.0     # right-column Tz numbers (rare; mostly none)
-BODY_LEFT_MIN = 63.0       # left column body starts around here
-BODY_RIGHT_MIN = 360.0
+# --- layout profiles ---------------------------------------------------------
+# Die BaFin-Vergleichs-PDFs kommen in unterschiedlichen Layouts (Spaltenlage,
+# Tz-Marginalspalte, Kopf-/Fußzeilen-Höhe, Überschriftsgrößen). Statt die Werte
+# fest zu verdrahten, sind sie hier je Dokumenttyp als Profil hinterlegt.
+# `use_profile(name)` schaltet das aktive Profil um; group_paragraphs liest
+# daraus. Default ist "konsultation" = das ursprünglich kalibrierte Verhalten.
+PROFILES = {
+    # Konsultationsfassung dl_kon_02_2026 – Ursprungskalibrierung.
+    "konsultation": {
+        "page_mid_x": 360.0,       # Trennung linke (Tz) / rechte (Erläuterung) Spalte
+        "tz_num_x_max": 62.0,      # linke Marginalspalte, wo Tz-Nummern stehen
+        "tz_num_x_max_r": 380.0,   # rechte Tz-Nummern (selten)
+        "crop_y_min": 110.0,       # oberhalb = Kopfzeile → verwerfen
+        "crop_y_max": 485.0,       # unterhalb = Fußzeile → verwerfen
+        "section_size_min": 11.5,  # ab dieser Schriftgröße = Abschnittsüberschrift
+        "subsection_size_min": 11.0,  # [sub, section) = Unterabschnitt
+    },
+    # Vergleichsfassung dl_rs_0626 (9. vs. 8. MaRisk) – Querformat, zwei
+    # Inhaltsverzeichnisse, rechte Spalte weiter rechts, Tz-Nummern bei ~64–67,
+    # Überschriften 12/14/16 pt, echter Text bis y≈505.
+    "vergleichsfassung": {
+        "page_mid_x": 447.0,
+        "tz_num_x_max": 75.0,
+        "tz_num_x_max_r": 380.0,
+        "crop_y_min": 78.0,
+        "crop_y_max": 515.0,
+        "section_size_min": 13.0,
+        "subsection_size_min": 11.5,
+    },
+}
+
+# Aktives Profil (Kopie, damit PROFILES unverändert bleibt).
+PROFILE = dict(PROFILES["konsultation"])
+
+
+def use_profile(name):
+    """Schaltet das aktive Layout-Profil um. Von analyze.py vor dem Parsen
+    aufzurufen. Wirft bei unbekanntem Namen."""
+    global PROFILE
+    if name not in PROFILES:
+        raise ValueError(
+            f"Unbekanntes Layout-Profil {name!r}; verfügbar: {sorted(PROFILES)}")
+    PROFILE = dict(PROFILES[name])
+    return PROFILE
+
+
+_TOC_SEC = {"AT", "BT", "BTO", "BTR"}
+_TOC_SEC_RE = re.compile(r"^(AT|BT|BTO|BTR)\d")
+
+
+def is_toc_page(page, min_hits=5):
+    """True, wenn die Seite ein Inhaltsverzeichnis ist.
+
+    Erkennungsmerkmal: mehrere Zeilen, die *links* mit einem Abschnittscode
+    (AT/BT/BTO/BTR) beginnen und *rechts* eine Seitenzahl tragen — das
+    typische IHV-Muster „AT 1  Ziel des Rundschreibens ........ 6".
+
+    Die reine „Zahl am rechten Rand"-Prüfung reichte nicht: Fließtextseiten
+    tragen dort Jahres-/Artikelnummern (z. B. „145", „2024") und würden sonst
+    fälschlich als IHV verworfen. Die Kombination Abschnittscode-links +
+    Zahl-rechts kommt praktisch nur im Inhaltsverzeichnis vor.
+    """
+    lines = {}
+    for w in page.get_text("words"):
+        if 90 < w[1] < 545:
+            lines.setdefault(round(w[1]), []).append(w)
+    hits = 0
+    for ws in lines.values():
+        ws.sort(key=lambda w: w[0])
+        left = ws[0][4].strip()
+        if not (left in _TOC_SEC or _TOC_SEC_RE.match(left)):
+            continue
+        if any(w[0] > 690 and w[4].strip().isdigit() for w in ws):
+            hits += 1
+            if hits >= min_hits:
+                return True
+    return False
 
 _BULLET_RE = re.compile(r"^\s*(?:[-•▪*·]|\(?[a-zA-Z]\)|\(?\d+[.)])(?:\s|$)")
 
@@ -218,10 +289,17 @@ def group_paragraphs(all_segs):
     'tz_body', 'body', 'number'.
     """
     # Filter out header/footer segments (page numbers, bafin info).
+    crop_y_min = PROFILE["crop_y_min"]
+    crop_y_max = PROFILE["crop_y_max"]
+    page_mid_x = PROFILE["page_mid_x"]
+    tz_num_x_max = PROFILE["tz_num_x_max"]
+    section_size_min = PROFILE["section_size_min"]
+    subsection_size_min = PROFILE["subsection_size_min"]
+
     clean = []
     for s in all_segs:
         y = s["y0"]
-        if y < 110 or y > 485:
+        if y < crop_y_min or y > crop_y_max:
             continue
         if s["size"] >= 7.9 and s["size"] <= 8.1 and "Seite" in s["text"]:
             continue
@@ -230,7 +308,7 @@ def group_paragraphs(all_segs):
     # Assign column
     for s in clean:
         xc = (s["x0"] + s["x1"]) / 2
-        s["col"] = "L" if xc < PAGE_MID_X else "R"
+        s["col"] = "L" if xc < page_mid_x else "R"
 
     # Group into lines on the same page/column by y proximity
     by_page = {}
@@ -267,7 +345,7 @@ def group_paragraphs(all_segs):
             line_sorted = sorted(line, key=lambda s: s["x0"])
             head = line_sorted[0]
             if (head["col"] == "L"
-                    and head["x0"] < TZ_NUM_X_MAX
+                    and head["x0"] < tz_num_x_max
                     and re.fullmatch(r"\d+[a-z]?", head["text"].strip())):
                 # Peel off ALL adjacent digit segments at the left
                 # margin (a renumbered Tz renders as two segments like
@@ -276,7 +354,7 @@ def group_paragraphs(all_segs):
                 # peeled number line).
                 k = 1
                 while (k < len(line_sorted)
-                       and line_sorted[k]["x0"] < TZ_NUM_X_MAX + 6
+                       and line_sorted[k]["x0"] < tz_num_x_max + 6
                        and re.fullmatch(r"\d+[a-z]?",
                                         line_sorted[k]["text"].strip())):
                     k += 1
@@ -297,11 +375,12 @@ def group_paragraphs(all_segs):
             max_y = max(s["y1"] for s in line)
             # classify line
             line_text = "".join(s["text"] for s in line).strip()
-            big = any(s["size"] >= 11.5 for s in line)
-            med = any(11.0 <= s["size"] < 11.5 for s in line)
+            big = any(s["size"] >= section_size_min for s in line)
+            med = any(subsection_size_min <= s["size"] < section_size_min
+                      for s in line)
             bold_only = all((s["flags"] & 16) for s in line) and not big and not med
             is_num = (col == "L"
-                      and min_x < TZ_NUM_X_MAX
+                      and min_x < tz_num_x_max
                       and re.fullmatch(r"\d+[a-z]?", line_text) is not None)
             kind = None
             if big:
@@ -337,9 +416,9 @@ def group_paragraphs(all_segs):
                     nxt_min_x = min(s["x0"] for s in nxt)
                     nxt_y = min(s["y0"] for s in nxt)
                     nxt_text = "".join(s["text"] for s in nxt).strip()
-                    if any(s["size"] >= 11 for s in nxt):
+                    if any(s["size"] >= subsection_size_min for s in nxt):
                         break
-                    if (col == "L" and nxt_min_x < TZ_NUM_X_MAX
+                    if (col == "L" and nxt_min_x < tz_num_x_max
                             and re.fullmatch(r"\d+[a-z]?", nxt_text) is not None):
                         break
                     if nxt_y - max_y > 10:

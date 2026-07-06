@@ -20,9 +20,19 @@ Installation:
 pip3 install --break-system-packages pymupdf openpyxl
 ```
 
-## Eingabedatei
+## Eingabedateien
 
-Die MaRisk-Vergleichs-PDF der BaFin muss im Projektverzeichnis liegen. Der erwartete Dateiname ist in [analyze.py](analyze.py) unter der Konstante `PDF` hinterlegt und kann bei einer neuen Novelle dort angepasst werden.
+Im Projektverzeichnis liegen:
+
+- **Vergleichs-PDF** (Pflicht) — das markierte BaFin-Vergleichsdokument. Dateiname in [analyze.py](analyze.py) unter `PDF`.
+- **Neue Einzelfassung** (optional, für Spalte A) — die unmarkierte neue MaRisk-Fassung.
+- **Alte Einzelfassung** (optional, für Spalte B) — die unmarkierte alte MaRisk-Fassung.
+
+Die beiden Einzelfassungen dienen als **zuverlässige Referenz** für die Spalten A/B: Der Textkörper jeder Tz wird gegen sie abgeglichen, um die neue bzw. alte Referenz zu bestimmen — unabhängig von der teils unzuverlässigen Abschnitts-/Seitenstruktur der Vergleichsfassung. Tz, die in der neuen Einzelfassung vorhanden sind, in der Vergleichsfassung aber nicht sauber zugeordnet werden konnten, werden aus der Einzelfassung **ergänzt**. Zuordnung von Dateiname → Referenzen und → Layout-Profil in [analyze.py](analyze.py) unter `REFERENCES` bzw. `DOCUMENTS`.
+
+### Layout-Profile
+
+Verschiedene BaFin-PDF-Generationen haben leicht unterschiedliche Layouts (Spaltenlage, Tz-Marginalspalte, Kopf-/Fußzeilen, Überschriftsgrößen). Diese Werte sind in [marisk_parser.py](marisk_parser.py) unter `PROFILES` je Dokumenttyp hinterlegt (`konsultation`, `vergleichsfassung`). Mehrseitige Inhaltsverzeichnisse werden automatisch erkannt und übersprungen (`is_toc_page`).
 
 ## Verwendung
 
@@ -34,19 +44,18 @@ Das Skript parst alle Seiten und erzeugt `MaRisk_Aenderungsanalyse_pro_Textziffe
 
 ## Aufbau der Excel-Ausgabe
 
-**Arbeitsblatt „Änderungen pro Tz" (Hauptblatt)** — eine Zeile pro Textziffer:
+**Arbeitsblatt „Änderungen pro Tz" (Hauptblatt)** — pro Textziffer **zwei Zeilen** untereinander: zuerst der Normtext, dann die Erläuterung:
 
 | Spalte | Inhalt |
 |---|---|
-| A Textziffer | neue Bezeichnung, z. B. `AT 4.4.2 Tz. 5`; bei vollständig gestrichenen alten Tz: `AT 4.4.2 alt Tz. 4` |
-| B alte Referenz | alter Pfad vor einer Umbenennung oder Umnummerierung; leer wenn unverändert |
-| C Normtext | Rich-Text des linken Spaltentexts der Tz, mit Farbmarkierungen und Strike/Underline |
-| D Erläuterung | Rich-Text aller zur Tz gehörenden rechten Spalten-Absätze |
-| E Änderungsart Normtext | unverändert / geändert / gestrichen / hinzugefügt / verschoben |
-| F Änderungsart Erläuterung | dasselbe Schema für die Erläuterung |
-| G Verschiebung | heuristischer Ziel- oder Herkunfts-Code (Volltext- oder Teiltext-Match) |
-| H Unsicher | `Ja`, wenn Verschiebungs-Match unter 75 % Ähnlichkeit |
-| I Anmerkungen | automatische Diff-Summary (Wortzahlen, Umformulierungs-Hinweis) + Verschiebungs-Vermerke inkl. Ähnlichkeit in %; `Teilverschiebung` = nur Teile des Textkörpers erscheinen an anderer Stelle |
+| A Textziffer | neue Referenz (Abschnitt + Tz-Nummer), per Textabgleich gegen die **neue Einzelfassung** bestimmt; leer, wenn die Tz vollständig gestrichen wurde |
+| B alte Referenz | alte Referenz, per Textabgleich gegen die **alte Einzelfassung** bestimmt; leer, wenn die Tz neu hinzugefügt wurde |
+| C Inhaltstyp | `Textziffer` (Normtext, linke PDF-Spalte), `Erläuterung` (rechte PDF-Spalte) oder `Überschrift` |
+| D Inhalt | Rich-Text des jeweiligen Inhalts mit Farbmarkierungen und Strike/Underline; Trennungs-Bindestriche am Zeilenende sind entfernt |
+| E Änderungsart | unverändert / geändert / gestrichen / hinzugefügt / verschoben (bezogen auf den Zeileninhalt) |
+| F Verschiebung | heuristischer Ziel- oder Herkunfts-Code (Volltext- oder Teiltext-Match) |
+| G Unsicher | `Ja`, wenn Verschiebungs-Match unter 75 % Ähnlichkeit |
+| H Anmerkungen | automatische Diff-Summary + Verschiebungs-Vermerke inkl. Ähnlichkeit in %; `Teilverschiebung` = nur Teile des Textkörpers erscheinen an anderer Stelle; `aus Neufassung ergänzt` = Tz aus der neuen Einzelfassung nachgetragen |
 
 **Arbeitsblatt „Legende"** — Erklärung aller Spalten und Farbcodes.
 
